@@ -110,25 +110,21 @@ func (ingest *Ingestion) Flush() error {
 
 		// PostgreSQL supports up to 65535 parameters.
 		if paramsCount[tableName] > 65000 {
-			fmt.Println("flushing", tableName)
 			_, err = ingest.DB.Exec(ingest.builders[tableName])
 			if err != nil {
-				return err
+				return errors.Wrap(err, fmt.Sprintf("Error adding values while inserting to %s", tableName))
 			}
 			paramsCount[tableName] = 0
 			ingest.createInsertBuilderByTableName(tableName)
 		}
 	}
 
-	fmt.Println("paramsCount", paramsCount)
-
 	// Exec the rest
 	for tableName, params := range paramsCount {
 		if params > 0 {
-			fmt.Println("last flushing", tableName)
 			_, err = ingest.DB.Exec(ingest.builders[tableName])
 			if err != nil {
-				return err
+				return errors.Wrap(err, fmt.Sprintf("Error adding values while inserting to %s", tableName))
 			}
 		}
 	}
@@ -147,34 +143,28 @@ func (ingest *Ingestion) Ledger(
 	header *core.LedgerHeader,
 	txs int,
 	ops int,
-) error {
+) {
 
-	sql := ingest.ledgers.Values(
-		CurrentVersion,
-		id,
-		header.Sequence,
-		header.LedgerHash,
-		null.NewString(header.PrevHash, header.Sequence > 1),
-		header.Data.TotalCoins,
-		header.Data.FeePool,
-		header.Data.BaseFee,
-		header.Data.BaseReserve,
-		header.Data.MaxTxSetSize,
-		time.Unix(header.CloseTime, 0).UTC(),
-		time.Now().UTC(),
-		time.Now().UTC(),
-		txs,
-		ops,
-		header.Data.LedgerVersion,
-		header.DataXDR(),
-	)
-
-	_, err := ingest.DB.Exec(sql)
-	if err != nil {
-		return err
+	ledger := ledgerRow{
+		ImporterVersion:    CurrentVersion,
+		ID:                 id,
+		Sequence:           header.Sequence,
+		LedgerHash:         header.LedgerHash,
+		PreviousLedgerHash: null.NewString(header.PrevHash, header.Sequence > 1),
+		TotalCoins:         int64(header.Data.TotalCoins),
+		FeePool:            int64(header.Data.FeePool),
+		BaseFee:            int32(header.Data.BaseFee),
+		BaseReserve:        int32(header.Data.BaseReserve),
+		MaxTxSetSize:       int32(header.Data.MaxTxSetSize),
+		ClosedAt:           time.Unix(header.CloseTime, 0).UTC(),
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
+		TransactionCount:   int32(txs),
+		OperationCount:     int32(ops),
+		ProtocolVersion:    int32(header.Data.LedgerVersion),
+		LedgerHeaderXDR:    null.StringFrom(header.DataXDR()),
 	}
-
-	return nil
+	ingest.rowsToInsert = append(ingest.rowsToInsert, ledger)
 }
 
 // Operation ingests the provided operation data into a new row in the
@@ -208,6 +198,7 @@ func (ingest *Ingestion) Operation(
 // UpdateAccountIDs updates IDs of the accounts before inserting
 // objects into DB.
 func (ingest *Ingestion) UpdateAccountIDs() error {
+	// address => ID in DB
 	accounts := map[string]int64{}
 	addresses := []string{}
 
@@ -225,8 +216,6 @@ func (ingest *Ingestion) UpdateAccountIDs() error {
 		return nil
 	}
 
-	fmt.Println("addresses to load", len(addresses))
-
 	// Get IDs and update map
 	q := history.Q{Session: ingest.DB}
 	dbAccounts := make([]history.Account, 0, len(addresses))
@@ -234,8 +223,6 @@ func (ingest *Ingestion) UpdateAccountIDs() error {
 	if err != nil {
 		return err
 	}
-
-	fmt.Println("accounts loaded", len(dbAccounts))
 
 	for _, row := range dbAccounts {
 		accounts[row.Address] = row.ID
@@ -249,22 +236,16 @@ func (ingest *Ingestion) UpdateAccountIDs() error {
 		}
 	}
 
-	if len(addresses) == 0 {
-		return nil
-	}
+	if len(addresses) > 0 {
+		dbAccounts = make([]history.Account, 0, len(addresses))
+		err = q.CreateAccounts(&dbAccounts, addresses)
+		if err != nil {
+			return err
+		}
 
-	fmt.Println("accounts to insert", len(addresses))
-
-	dbAccounts = make([]history.Account, 0, len(addresses))
-	err = q.CreateAccounts(&dbAccounts, addresses)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("accounts inserted", len(dbAccounts))
-
-	for _, row := range dbAccounts {
-		accounts[row.Address] = row.ID
+		for _, row := range dbAccounts {
+			accounts[row.Address] = row.ID
+		}
 	}
 
 	// Update IDs in objects
@@ -308,33 +289,6 @@ func (ingest *Ingestion) Start() (err error) {
 	ingest.createInsertBuilders()
 	ingest.rowsToInsert = []row{}
 	return
-}
-
-// transactionInsertBuilder returns sql.InsertBuilder for a single transaction
-func (ingest *Ingestion) transactionInsertBuilder(id int64, tx *core.Transaction, fee *core.TransactionFee) sq.InsertBuilder {
-	// Enquote empty signatures
-	signatures := tx.Base64Signatures()
-
-	return ingest.transactions.Values(
-		id,
-		tx.TransactionHash,
-		tx.LedgerSequence,
-		tx.Index,
-		tx.SourceAddress(),
-		tx.Sequence(),
-		tx.Fee(),
-		len(tx.Envelope.Tx.Operations),
-		tx.EnvelopeXDR(),
-		tx.ResultXDR(),
-		tx.ResultMetaXDR(),
-		fee.ChangesXDR(),
-		sqx.StringArray(signatures),
-		ingest.formatTimeBounds(tx.Envelope.Tx.TimeBounds),
-		tx.MemoType(),
-		tx.Memo(),
-		time.Now().UTC(),
-		time.Now().UTC(),
-	)
 }
 
 // Trade records a trade into the history_trades table
@@ -396,15 +350,31 @@ func (ingest *Ingestion) Transaction(
 	id int64,
 	tx *core.Transaction,
 	fee *core.TransactionFee,
-) error {
+) {
 
-	sql := ingest.transactionInsertBuilder(id, tx, fee)
-	_, err := ingest.DB.Exec(sql)
-	if err != nil {
-		return err
+	signatures := tx.Base64Signatures()
+
+	transaction := transactionRow{
+		ID:               id,
+		TransactionHash:  tx.TransactionHash,
+		LedgerSequence:   tx.LedgerSequence,
+		ApplicationOrder: tx.Index,
+		Account:          tx.SourceAddress(),
+		AccountSequence:  tx.Sequence(),
+		FeePaid:          tx.Fee(),
+		OperationCount:   len(tx.Envelope.Tx.Operations),
+		TxEnvelope:       tx.EnvelopeXDR(),
+		TxResult:         tx.ResultXDR(),
+		TxMeta:           tx.ResultMetaXDR(),
+		TxFeeMeta:        fee.ChangesXDR(),
+		SignaturesString: sqx.StringArray(signatures),
+		TimeBounds:       ingest.formatTimeBounds(tx.Envelope.Tx.TimeBounds),
+		MemoType:         tx.MemoType(),
+		Memo:             tx.Memo(),
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
 	}
-
-	return nil
+	ingest.rowsToInsert = append(ingest.rowsToInsert, transaction)
 }
 
 // TransactionParticipants ingests the provided account ids as participants of
@@ -473,27 +443,8 @@ func (ingest *Ingestion) createTradesInsertBuilder() {
 	)
 }
 
-func (ingest *Ingestion) createInsertBuilderByTableName(name TableName) {
-	switch name {
-	case OperationsTableName:
-		ingest.createOperationsInsertBuilder()
-	case EffectsTableName:
-		ingest.createEffectsInsertBuilder()
-	case TradesTableName:
-		ingest.createTradesInsertBuilder()
-	case OperationParticipantsTableName:
-		ingest.createOperationParticipantsInsertBuilder()
-	case TransactionParticipantsTableName:
-		ingest.createTransactionParticipantsInsertBuilder()
-	default:
-		panic("Invalid table name")
-	}
-}
-
-func (ingest *Ingestion) createInsertBuilders() {
-	ingest.builders = make(map[TableName]sq.InsertBuilder)
-
-	ingest.ledgers = sq.Insert("history_ledgers").Columns(
+func (ingest *Ingestion) createLedgersInsertBuilder() {
+	ingest.builders[LedgersTableName] = sq.Insert("history_ledgers").Columns(
 		"importer_version",
 		"id",
 		"sequence",
@@ -512,8 +463,10 @@ func (ingest *Ingestion) createInsertBuilders() {
 		"protocol_version",
 		"ledger_header",
 	)
+}
 
-	ingest.transactions = sq.Insert("history_transactions").Columns(
+func (ingest *Ingestion) createTransactionsInsertBuilder() {
+	ingest.builders[TransactionsTableName] = sq.Insert("history_transactions").Columns(
 		"id",
 		"transaction_hash",
 		"ledger_sequence",
@@ -533,12 +486,39 @@ func (ingest *Ingestion) createInsertBuilders() {
 		"created_at",
 		"updated_at",
 	)
+}
 
-	ingest.createOperationsInsertBuilder()
-	ingest.createOperationParticipantsInsertBuilder()
-	ingest.createTransactionParticipantsInsertBuilder()
+func (ingest *Ingestion) createInsertBuilderByTableName(name TableName) {
+	switch name {
+	case OperationsTableName:
+		ingest.createOperationsInsertBuilder()
+	case EffectsTableName:
+		ingest.createEffectsInsertBuilder()
+	case LedgersTableName:
+		ingest.createLedgersInsertBuilder()
+	case TradesTableName:
+		ingest.createTradesInsertBuilder()
+	case OperationParticipantsTableName:
+		ingest.createOperationParticipantsInsertBuilder()
+	case TransactionsTableName:
+		ingest.createTransactionsInsertBuilder()
+	case TransactionParticipantsTableName:
+		ingest.createTransactionParticipantsInsertBuilder()
+	default:
+		panic("Invalid table name")
+	}
+}
+
+func (ingest *Ingestion) createInsertBuilders() {
+	ingest.builders = make(map[TableName]sq.InsertBuilder)
+
 	ingest.createEffectsInsertBuilder()
+	ingest.createLedgersInsertBuilder()
+	ingest.createOperationParticipantsInsertBuilder()
+	ingest.createOperationsInsertBuilder()
 	ingest.createTradesInsertBuilder()
+	ingest.createTransactionParticipantsInsertBuilder()
+	ingest.createTransactionsInsertBuilder()
 
 	ingest.assetStats = sq.Insert("asset_stats").Columns(
 		"id",

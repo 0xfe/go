@@ -27,13 +27,6 @@ func (is *Session) Run() {
 		return
 	}
 
-	start2 := time.Now()
-
-	defer func() {
-		elapsed := time.Now().Sub(start2)
-		fmt.Println("Session.Run", elapsed)
-	}()
-
 	is.Err = is.Ingestion.Start()
 	if is.Err != nil {
 		return
@@ -103,13 +96,6 @@ func (is *Session) effectFlagDetails(flagDetails map[string]bool, flagPtr *xdr.U
 }
 
 func (is *Session) flush() {
-	start2 := time.Now()
-
-	defer func() {
-		elapsed := time.Now().Sub(start2)
-		fmt.Println("Session.flush", elapsed)
-	}()
-
 	if is.Err != nil {
 		return
 	}
@@ -334,16 +320,12 @@ func (is *Session) ingestLedger() {
 	}
 
 	start := time.Now()
-	is.Err = is.Ingestion.Ledger(
+	is.Ingestion.Ledger(
 		is.Cursor.LedgerID(),
 		is.Cursor.Ledger(),
 		is.Cursor.SuccessfulTransactionCount(),
 		is.Cursor.SuccessfulLedgerOperationCount(),
 	)
-
-	if is.Err != nil {
-		return
-	}
 
 	for is.Cursor.NextTx() {
 		is.ingestTransaction()
@@ -554,14 +536,11 @@ func (is *Session) ingestTransaction() {
 	if !is.Cursor.Transaction().IsSuccessful() {
 		return
 	}
-	is.Err = is.Ingestion.Transaction(
+	is.Ingestion.Transaction(
 		is.Cursor.TransactionID(),
 		is.Cursor.Transaction(),
 		is.Cursor.TransactionFee(),
 	)
-	if is.Err != nil {
-		return
-	}
 
 	for is.Cursor.NextOp() {
 		is.ingestOperation()
